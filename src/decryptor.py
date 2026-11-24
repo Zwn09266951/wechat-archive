@@ -22,8 +22,22 @@ def _load_wcdb_tool(wcdb_tool_dir: str):
     tool_dir = os.path.abspath(wcdb_tool_dir)
     if tool_dir not in sys.path:
         sys.path.insert(0, tool_dir)
-    import wcdb_key_tool_windows as wkt  # type: ignore
+    if sys.platform == "win32":
+        import wcdb_key_tool_windows as wkt  # type: ignore
+    elif sys.platform == "darwin":
+        import wcdb_key_tool_macos as wkt  # type: ignore
+    else:
+        import wcdb_key_tool as wkt  # type: ignore
     return wkt
+
+
+def auto_detect_db_storage_dir(wcdb_tool_dir: str) -> Optional[str]:
+    """尝试自动检测当前平台的微信 db_storage 目录。"""
+    wkt = _load_wcdb_tool(wcdb_tool_dir)
+    finder = getattr(wkt, "auto_detect_db_dir", None)
+    if callable(finder):
+        return finder()
+    return None
 
 
 def _wal_checksum(data: bytes, s0: int, s1: int, big_endian: bool) -> Tuple[int, int]:
@@ -44,10 +58,50 @@ def load_keys(keys_file: str) -> Dict[str, dict]:
 
 
 def refresh_keys(db_storage_dir: str, keys_file: str, wcdb_tool_dir: str) -> Dict[str, dict]:
-    """从当前运行中的 Weixin.exe 进程只读扫描并更新本地密钥文件。"""
+    """按平台刷新微信数据库密钥文件。"""
     wkt = _load_wcdb_tool(wcdb_tool_dir)
     os.makedirs(os.path.dirname(os.path.abspath(keys_file)), exist_ok=True)
-    logger.info("正在从运行中的 Weixin.exe 只读扫描数据库密钥...")
+
+    if sys.platform == "win32":
+        logger.info("正在从运行中的 Weixin.exe 只读扫描数据库密钥...")
+        wkt._scan_memory_raw_key(db_storage_dir, keys_file)
+        return load_keys(keys_file)
+
+    if sys.platform == "darwin":
+        db_files, salt_to_dbs = wkt.collect_db_files(db_storage_dir)
+        if not db_files:
+            raise RuntimeError(f"未在 {db_storage_dir} 找到微信数据库文件")
+
+        # 1. 优先使用已缓存的 passphrase 进行 PBKDF2 派生（无需 root / 无需重启微信）
+        passphrase_hex = wkt.load_passphrase()
+        if passphrase_hex:
+            logger.info("正在使用已缓存的 macOS passphrase 派生数据库密钥（约需 30-60 秒）...")
+            key_map = wkt._derive_keys_from_passphrase(bytes.fromhex(passphrase_hex), db_files, salt_to_dbs)
+            if key_map:
+                wkt._save_results(db_files, salt_to_dbs, key_map, db_storage_dir, keys_file)
+                return load_keys(keys_file)
+            logger.warning("已缓存的 passphrase 未能验证通过，将继续尝试提取...")
+
+        # 2. 尝试内存扫描（微信 4.0.x 且具备 root 权限时有效）
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            try:
+                logger.info("正在尝试从 macOS WeChat 进程扫描内存密钥...")
+                wkt._scan_memory_raw_key(db_storage_dir, keys_file)
+                return load_keys(keys_file)
+            except Exception as e:
+                logger.warning("macOS 内存扫描未能获取到密钥: %s", e)
+
+        tool_script = os.path.join(os.path.abspath(wcdb_tool_dir), "wcdb_key_tool_macos.py")
+        raise RuntimeError(
+            "macOS 首次提取微信 4.1+ 数据库密钥需要 root 权限与 LLDB 断点捕获（只需执行一次）。\n"
+            "请先在终端运行：\n"
+            f'  sudo python3 "{tool_script}" extract --db-dir "{db_storage_dir}" --output "{keys_file}"\n'
+            "如提示签名校验失败，请先执行一次重签名并重启微信：\n"
+            "  sudo codesign --force --deep --sign - /Applications/WeChat.app"
+        )
+
+    # Linux 等其他平台回退
+    logger.info("正在尝试扫描数据库密钥...")
     wkt._scan_memory_raw_key(db_storage_dir, keys_file)
     return load_keys(keys_file)
 
@@ -203,7 +257,7 @@ def decrypt_single_db(
 def discover_target_dbs(db_storage_dir: str, include_biz: bool = False) -> List[str]:
     """发现归档所需的联系人、会话及所有消息分库（message_0.db, message_1.db, ...）。"""
     targets: List[str] = []
-    for fixed in (r"contact\contact.db", r"session\session.db"):
+    for fixed in (os.path.join("contact", "contact.db"), os.path.join("session", "session.db")):
         if os.path.exists(os.path.join(db_storage_dir, fixed)):
             targets.append(fixed)
 

@@ -1,5 +1,5 @@
 {
-  "db_storage_dir": "<WeChat db_storage directory path>",
+  "db_storage_dir": "auto",
   "self_wxid": "<your_wxid>",
   "keys_file": "./secrets/all_keys.json",
   "state_file": "./state/archive_state.json",

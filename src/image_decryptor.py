@@ -1,12 +1,14 @@
 """微信 4.x 本地图片附件（.dat）索引、V1/V2 解密与账号图片密钥只读提取模块。
 
-零第三方依赖：基于 Windows 原生 CNG (bcrypt.dll) 进行 AES-128-ECB 解密。
+零第三方依赖：
+- Windows：基于原生 CNG (bcrypt.dll) 进行 AES-128-ECB 解密
+- macOS：基于系统原生 CommonCrypto (CCCrypt) 进行 AES-128-ECB 解密
 """
 from __future__ import annotations
 
 import collections
 import ctypes
-import ctypes.wintypes as wt
+import ctypes.util
 import json
 import logging
 import os
@@ -31,10 +33,12 @@ MEM_ALNUM32_RE = re.compile(rb"(?<![0-9a-zA-Z])[0-9a-z]{32}(?![0-9a-zA-Z])")
 
 
 # ============================================================
-# Windows CNG (bcrypt.dll) AES-128-ECB 高性能解密器
+# 跨平台原生 AES-128-ECB 高性能解密器（Windows CNG / macOS CommonCrypto）
 # ============================================================
 
 if sys.platform == "win32":
+    import ctypes.wintypes as wt
+
     _bcrypt = ctypes.WinDLL("bcrypt")
     _bcrypt.BCryptOpenAlgorithmProvider.argtypes = [
         ctypes.POINTER(wt.HANDLE),
@@ -73,60 +77,109 @@ if sys.platform == "win32":
     _bcrypt.BCryptDestroyKey.argtypes = [wt.HANDLE]
     _bcrypt.BCryptCloseAlgorithmProvider.argtypes = [wt.HANDLE, ctypes.c_ulong]
 
+elif sys.platform == "darwin":
+    _libSystem = ctypes.CDLL(ctypes.util.find_library("System"))
+    _libSystem.CCCrypt.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    _libSystem.CCCrypt.restype = ctypes.c_int32
+    _kCCDecrypt = 1
+    _kCCAlgorithmAES = 0
+    _kCCOptionECBMode = 2
+
 
 class AesEcbDecryptor:
-    """复用单个 CNG Algorithm/Key 句柄的高速 AES-128-ECB 解密器。"""
+    """跨平台 AES-ECB 解密器（Windows 走 CNG bcrypt.dll，macOS 走 CommonCrypto CCCrypt）。"""
 
     def __init__(self, key: bytes) -> None:
         if len(key) not in (16, 24, 32):
             raise ValueError(f"无效 AES 密钥长度: {len(key)}")
-        self._h_alg = wt.HANDLE()
-        self._h_key = wt.HANDLE()
-        status = _bcrypt.BCryptOpenAlgorithmProvider(ctypes.byref(self._h_alg), "AES", None, 0)
-        if status != 0:
-            raise RuntimeError(f"BCryptOpenAlgorithmProvider failed: {status:#x}")
-        try:
-            mode = "ChainingModeECB\x00".encode("utf-16-le")
-            status = _bcrypt.BCryptSetProperty(self._h_alg, "ChainingMode", mode, len(mode), 0)
+        self._key_bytes = key
+        self._h_alg = None
+        self._h_key = None
+
+        if sys.platform == "win32":
+            self._h_alg = wt.HANDLE()
+            self._h_key = wt.HANDLE()
+            status = _bcrypt.BCryptOpenAlgorithmProvider(ctypes.byref(self._h_alg), "AES", None, 0)
             if status != 0:
-                raise RuntimeError(f"BCryptSetProperty failed: {status:#x}")
-            status = _bcrypt.BCryptGenerateSymmetricKey(
-                self._h_alg, ctypes.byref(self._h_key), None, 0, key, len(key), 0
-            )
-            if status != 0:
-                raise RuntimeError(f"BCryptGenerateSymmetricKey failed: {status:#x}")
-        except Exception:
-            self.close()
-            raise
+                raise RuntimeError(f"BCryptOpenAlgorithmProvider failed: {status:#x}")
+            try:
+                mode = "ChainingModeECB\x00".encode("utf-16-le")
+                status = _bcrypt.BCryptSetProperty(self._h_alg, "ChainingMode", mode, len(mode), 0)
+                if status != 0:
+                    raise RuntimeError(f"BCryptSetProperty failed: {status:#x}")
+                status = _bcrypt.BCryptGenerateSymmetricKey(
+                    self._h_alg, ctypes.byref(self._h_key), None, 0, key, len(key), 0
+                )
+                if status != 0:
+                    raise RuntimeError(f"BCryptGenerateSymmetricKey failed: {status:#x}")
+            except Exception:
+                self.close()
+                raise
+        elif sys.platform != "darwin":
+            raise RuntimeError(f"当前平台 {sys.platform} 暂不支持内置 AES-ECB 解密")
 
     def decrypt(self, data: bytes) -> bytes:
         if not data:
             return b""
-        out = ctypes.create_string_buffer(len(data))
-        out_len = wt.ULONG(0)
-        status = _bcrypt.BCryptDecrypt(
-            self._h_key,
+        if sys.platform == "win32":
+            out = ctypes.create_string_buffer(len(data))
+            out_len = wt.ULONG(0)
+            status = _bcrypt.BCryptDecrypt(
+                self._h_key,
+                data,
+                len(data),
+                None,
+                None,
+                0,
+                out,
+                len(data),
+                ctypes.byref(out_len),
+                0,
+            )
+            if status != 0:
+                raise RuntimeError(f"BCryptDecrypt failed: {status:#x}")
+            return out.raw[: out_len.value]
+
+        # macOS CommonCrypto AES-ECB（无 padding，与 Windows CNG 行为一致）
+        out = ctypes.create_string_buffer(len(data) + 16)
+        out_len = ctypes.c_size_t(0)
+        status = _libSystem.CCCrypt(
+            _kCCDecrypt,
+            _kCCAlgorithmAES,
+            _kCCOptionECBMode,
+            self._key_bytes,
+            len(self._key_bytes),
+            None,
             data,
             len(data),
-            None,
-            None,
-            0,
             out,
-            len(data),
+            len(out),
             ctypes.byref(out_len),
-            0,
         )
         if status != 0:
-            raise RuntimeError(f"BCryptDecrypt failed: {status:#x}")
+            raise RuntimeError(f"CommonCrypto CCCrypt failed: status={status}")
         return out.raw[: out_len.value]
 
     def close(self) -> None:
-        if self._h_key and self._h_key.value:
-            _bcrypt.BCryptDestroyKey(self._h_key)
-            self._h_key = wt.HANDLE()
-        if self._h_alg and self._h_alg.value:
-            _bcrypt.BCryptCloseAlgorithmProvider(self._h_alg, 0)
-            self._h_alg = wt.HANDLE()
+        if sys.platform == "win32":
+            if self._h_key and self._h_key.value:
+                _bcrypt.BCryptDestroyKey(self._h_key)
+                self._h_key = wt.HANDLE()
+            if self._h_alg and self._h_alg.value:
+                _bcrypt.BCryptCloseAlgorithmProvider(self._h_alg, 0)
+                self._h_alg = wt.HANDLE()
 
     def __enter__(self) -> "AesEcbDecryptor":
         return self
@@ -305,11 +358,165 @@ def _find_weixin_pids() -> List[Tuple[int, int]]:
     return pids
 
 
+def _scan_v2_aes_key_macos(samples: Sequence[bytes]) -> Optional[bytes]:
+    """从运行中的 macOS WeChat 进程只读扫描并校验 V2 图片 AES-128 密钥（需 sudo 与重签名）。"""
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        logger.warning(
+            "macOS 提取图片 V2 AES 密钥需要 root 权限（只需执行一次）。"
+            "请打开微信点开任意一张大图后执行：sudo python3 src/run_archive.py --refresh-image-key"
+        )
+        return None
+
+    pids: List[int] = []
+    for proc_name in ("WeChat", "Weixin"):
+        try:
+            r = subprocess.run(["pgrep", "-x", proc_name], capture_output=True, text=True, timeout=5)
+            for line in (r.stdout or "").splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    pids.append(int(line))
+        except Exception:
+            continue
+    if not pids:
+        logger.warning("未找到运行中的 macOS WeChat 进程，无法提取图片 V2 AES 密钥")
+        return None
+
+    KERN_SUCCESS = 0
+    VM_REGION_BASIC_INFO_64 = 9
+    VM_REGION_BASIC_INFO_COUNT_64 = 9
+    VM_PROT_READ = 0x01
+
+    class _VmRegionBasicInfo64(ctypes.Structure):
+        _fields_ = [
+            ("protection", ctypes.c_int32),
+            ("max_protection", ctypes.c_int32),
+            ("inheritance", ctypes.c_uint32),
+            ("shared", ctypes.c_uint32),
+            ("reserved", ctypes.c_uint32),
+            ("offset", ctypes.c_uint64),
+            ("behavior", ctypes.c_int32),
+            ("user_wired_count", ctypes.c_uint16),
+        ]
+
+    tested: set[bytes] = set()
+    first_sample = samples[0]
+    out_buf = ctypes.create_string_buffer(32)
+    out_len = ctypes.c_size_t(0)
+
+    def _quick_test_key(k16: bytes) -> bool:
+        if k16 in tested:
+            return False
+        tested.add(k16)
+        st = _libSystem.CCCrypt(
+            _kCCDecrypt, _kCCAlgorithmAES, _kCCOptionECBMode,
+            k16, 16, None, first_sample, 16, out_buf, 32, ctypes.byref(out_len),
+        )
+        if st != 0 or not _is_valid_first_block(out_buf.raw[:16]):
+            return False
+        for s_blk in samples[1:]:
+            st2 = _libSystem.CCCrypt(
+                _kCCDecrypt, _kCCAlgorithmAES, _kCCOptionECBMode,
+                k16, 16, None, s_blk, 16, out_buf, 32, ctypes.byref(out_len),
+            )
+            if st2 != 0 or not _is_valid_first_block(out_buf.raw[:16]):
+                return False
+        return True
+
+    for pid in pids:
+        task = ctypes.c_uint32(0)
+        kr = _libSystem.task_for_pid(_libSystem.mach_task_self(), ctypes.c_int(pid), ctypes.byref(task))
+        if kr != KERN_SUCCESS:
+            logger.warning(
+                "task_for_pid 失败 (PID=%d, kr=%d)，请确认已对 WeChat.app 执行重签名并重启微信",
+                pid, kr,
+            )
+            continue
+
+        logger.info("正在扫描 macOS WeChat (PID=%d) 内存以提取图片 V2 AES 密钥...", pid)
+        address = ctypes.c_uint64(0)
+        size = ctypes.c_uint64(0)
+        info = _VmRegionBasicInfo64()
+        info_count = ctypes.c_uint32(VM_REGION_BASIC_INFO_COUNT_64)
+        object_name = ctypes.c_uint32(0)
+
+        while True:
+            kr = _libSystem.mach_vm_region(
+                ctypes.c_uint32(task.value),
+                ctypes.byref(address),
+                ctypes.byref(size),
+                ctypes.c_int(VM_REGION_BASIC_INFO_64),
+                ctypes.byref(info),
+                ctypes.byref(info_count),
+                ctypes.byref(object_name),
+            )
+            if kr != KERN_SUCCESS:
+                break
+
+            reg_addr = address.value
+            reg_size = size.value
+            next_addr = reg_addr + reg_size
+            if next_addr <= reg_addr:
+                break
+            address.value = next_addr
+
+            if not (info.protection & VM_PROT_READ) or reg_size == 0 or reg_size > 256 * 1024 * 1024:
+                continue
+
+            data_ptr = ctypes.c_uint64(0)
+            data_size = ctypes.c_uint64(0)
+            kr_r = _libSystem.mach_vm_read(
+                ctypes.c_uint32(task.value),
+                ctypes.c_uint64(reg_addr),
+                ctypes.c_uint64(reg_size),
+                ctypes.byref(data_ptr),
+                ctypes.byref(data_size),
+            )
+            if kr_r != KERN_SUCCESS or data_size.value == 0:
+                continue
+            try:
+                raw = ctypes.string_at(data_ptr.value, data_size.value)
+            finally:
+                _libSystem.mach_vm_deallocate(_libSystem.mach_task_self(), data_ptr, data_size)
+
+            for m in MEM_HEX16_RE.finditer(raw):
+                k16 = m.group(0)
+                if _quick_test_key(k16):
+                    logger.info("成功提取并校验图片 V2 AES 密钥 (macOS 16位hex ASCII，共测试 %d 个候选)", len(tested))
+                    return k16
+            for m in MEM_HEX32_RE.finditer(raw):
+                cand32 = m.group(0)
+                if _quick_test_key(cand32[:16]):
+                    logger.info("成功提取并校验图片 V2 AES 密钥 (macOS 32位hex前16，共测试 %d 个候选)", len(tested))
+                    return cand32[:16]
+                try:
+                    k_raw = bytes.fromhex(cand32.decode("ascii"))
+                    if _quick_test_key(k_raw):
+                        logger.info("成功提取并校验图片 V2 AES 密钥 (macOS 32位hex raw，共测试 %d 个候选)", len(tested))
+                        return k_raw
+                except ValueError:
+                    pass
+            for pat in (MEM_ALNUM16_RE, MEM_ALNUM32_RE):
+                for m in pat.finditer(raw):
+                    k_ascii = m.group(0)[:16]
+                    if _quick_test_key(k_ascii):
+                        logger.info("成功提取并校验图片 V2 AES 密钥 (macOS alnum ASCII，共测试 %d 个候选)", len(tested))
+                        return k_ascii
+
+    logger.warning("扫描了 %d 个候选密钥，但未在 macOS WeChat 内存中命中图片 V2 AES 密钥（请先点开任意一张大图后重试）", len(tested))
+    return None
+
+
 def scan_v2_aes_key_from_memory(attach_dir: str) -> Optional[bytes]:
-    """从当前运行中的 Weixin.exe 进程只读扫描并校验 V2 图片 AES-128 密钥（16 字节）。"""
+    """从当前运行中的微信进程只读扫描并校验 V2 图片 AES-128 密钥（16 字节）。"""
     samples = _collect_v2_samples(attach_dir, limit=4)
     if not samples:
         logger.warning("未在 %s 找到 V2 .dat 样本文件，无法校验图片密钥", attach_dir)
+        return None
+
+    if sys.platform == "darwin":
+        return _scan_v2_aes_key_macos(samples)
+    if sys.platform != "win32":
+        logger.warning("当前平台 %s 暂不支持自动扫描图片 V2 AES 密钥", sys.platform)
         return None
 
     pids = _find_weixin_pids()
