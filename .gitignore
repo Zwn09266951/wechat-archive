@@ -1,0 +1,8 @@
+secrets/
+state/
+logs/
+notes/
+tmp_decrypted/
+config.json
+__pycache__/
+*.pyc

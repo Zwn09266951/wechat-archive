@@ -1,0 +1,14 @@
+{
+  "db_storage_dir": "<WeChat db_storage directory path>",
+  "self_wxid": "<your_wxid>",
+  "keys_file": "./secrets/all_keys.json",
+  "state_file": "./state/archive_state.json",
+  "notes_dir": "./notes",
+  "logs_dir": "./logs",
+  "wcdb_tool_dir": "./vendor/wcdb-key-tool",
+  "include_biz_messages": false,
+  "include_system_chats": false,
+  "export_images": true,
+  "split_threshold_messages": 3000,
+  "chunk_max_messages": 2000
+}
